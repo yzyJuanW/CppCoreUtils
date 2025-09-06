@@ -3,13 +3,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <thread>
 
 #include "utils/blocking_queue.hpp"
+#include "utils/current_thread.h"
 #include "utils/singleton.h"
 #include "utils/thread_pool.hpp"
-
 
 using namespace ywh::utils;
 
@@ -18,7 +19,7 @@ class ThreadPoolTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // 创建线程池，使用4个工作线程
-    pool = std::make_unique<ThreadPool>(4);
+    pool = std::make_unique<ThreadPool>(16);
   }
 
   void TearDown() override {
@@ -187,4 +188,85 @@ TEST_F(ThreadPoolTest, PoolSize) {
 
   // 验证最大并发数等于线程池大小
   EXPECT_EQ(expectedSize, maxConcurrentTasks);
+}
+
+void ComputeIntensiveTask() {
+  volatile double result = 0.0;
+  // 进行大量浮点计算
+  for (int i = 0; i < 10000000; ++i) {
+    result += std::sin(i) * std::cos(i) / std::exp(0.01 * i);
+  }
+  // 防止编译器优化掉整个循环
+  (void)result;
+}
+
+TEST_F(ThreadPoolTest, ComputeIntensiveTask) {
+  const int task_total_count = 1000;
+  std::atomic<int> task_count(0);
+  std::mutex mutex;
+  std::condition_variable cv;
+  for (int i = 0; i < task_total_count; i++) {
+    task_count++;
+    pool->Enqueue([&] {
+      ComputeIntensiveTask();  // 模拟你的多线程任务
+      if (--task_count == 0) {
+        std::lock_guard<std::mutex> lock(mutex);
+        cv.notify_one();
+      }
+    });
+  }
+  fmt::print("now task count : {}\n", task_count);
+  // 等待所有任务完成
+  std::unique_lock<std::mutex> lock(mutex);
+  cv.wait(lock, [&] { return task_count == 0; });
+
+  fmt::print("all task finish!!!!  task count : {}\n", task_count);
+}
+
+TEST_F(ThreadPoolTest, TestThreadId) {
+  const int task_total_count = 50;
+  for (int i = 0; i < task_total_count; i++) {
+    pool->Enqueue(
+        [&, i]() { fmt::print("i = {}, thread id = {}\n", i, current_thread::GetTid()); });
+  }
+}
+
+TEST_F(ThreadPoolTest, TestPoolGetFuture) {
+  const int task_total_count = 50;
+
+  std::vector<std::future<int>> futures;
+
+  for (int i = 0; i < task_total_count; i++) {
+    if (i % 2 == 0) {
+      futures.push_back(pool->EnqueueWithFuture([i] {
+        fmt::print("run the enqueue with future, i = {}\n", i);
+        return i * i;
+      }));
+    } else {
+      pool->Enqueue([i] {
+        fmt::print("run the enqueue no future, i = {}\n", i);
+        return i;
+      });
+    }
+  }
+  for (auto& future : futures) {
+    fmt::print("get the res : {}\n", future.get());
+  }
+}
+
+TEST_F(ThreadPoolTest, TestPoolGetFutureWait) {
+  const int task_total_count = 50;
+
+  std::atomic<int> task_count(0);
+  std::vector<std::future<void>> futures;
+
+  for (int i = 0; i < task_total_count; i++) {
+    futures.push_back(pool->EnqueueWithFuture([&](int i) {
+      fmt::print("run the enqueue with future, i = {}, count = {}\n", i, task_count++);
+    }, i));
+  }
+  for (auto& future : futures) {
+    future.wait();
+  }
+  fmt::print("task count = {}, tast total count = {}\n", task_count, task_total_count);
 }
